@@ -1,0 +1,339 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+### TO-DO:
+
+1.  Re asses handling of missing hours -\> should be treated as 0? Munyo does not do that, but it seems useful
+2.  Why are points in rdplot() never above one another?
+
+### The dataset stems from the city of New York <insert link>.
+
+```{r}
+library(pacman)
+p_load(tidyverse)
+nypd_complaints <- read_csv("NYPD_Complaint_Data_Historic.csv")
+```
+
+### Filtering the dataset to only include robbery and burglary (this is not quite equivalent to robbery and theft, but close enough).
+
+```{r}
+# Create the new dataframe with only relevant rows and label them
+robburg <- nypd_complaints %>%
+  filter(OFNS_DESC %in% c(
+    # Theft-related offense descriptions
+    "GRAND LARCENY",
+    "PETIT LARCENY",
+    "GRAND LARCENY OF MOTOR VEHICLE",
+    "PETIT LARCENY OF MOTOR VEHICLE",
+    "THEFT-FRAUD",
+    "THEFT OF SERVICES",
+    "OTHER OFFENSES RELATED TO THEF",
+    "POSSESSION OF STOLEN PROPERTY",
+    "FRAUDS",
+    "FORGERY",
+    "FRAUDULENT ACCOSTING",
+    "JOSTLING",
+    
+    # Robbery-specific (only one)
+    "ROBBERY"
+  )) %>%
+  mutate(THEFT_OR_ROBBERY = case_when(
+    OFNS_DESC == "ROBBERY" ~ "ROBBERY",
+    TRUE ~ "THEFT"
+  ))
+head(robburg)
+```
+
+### Now a little bit of restructuring!
+
+```{r}
+# CHECK if anything of this is relevant later on!!!
+
+robburg <- robburg %>%
+  mutate(
+    # Convert CMPLNT_FR_DT (time of incoming 911 call) to Date
+    date_parsed = mdy(CMPLNT_FR_DT),
+    # Combine date and time into a POSIXct datetime
+    startdt = as.POSIXct(date_parsed + CMPLNT_FR_TM, origin = "1970-01-01", tz = "America/New_York")
+  )
+
+# ---------------------
+
+robburg <- robburg %>%
+  mutate(date_parsed = mdy(CMPLNT_FR_DT))
+
+# Extract year from CMPLNT_FR_DT
+robburg <- robburg %>%
+  mutate(year_parsed = year(date_parsed))
+
+# Some years in CMPLNT_FR_DT are incorrect, so I fix it using the year from CMPLNT_TO_DT. I only do so when the year from CMPLNT_FR_DT exceeds the theoretical timeframe. There is still a possibility that some of the years are not correct.
+robburg <- robburg %>%
+  mutate(
+    alt_date = mdy(CMPLNT_TO_DT),
+    alt_year = year(alt_date),
+    corrected_year = case_when(
+      is.na(date_parsed) ~ NA_integer_,
+      year_parsed < 2006 | year_parsed > 2025 ~ alt_year,
+      TRUE ~ year_parsed
+    )
+  )
+
+# Because some faulty rows do not include CMPLNT_FR_DT, in the last step, I only keep rows with valid years.
+robburg <- robburg %>%
+  filter(!is.na(corrected_year) & corrected_year >= 2006 & corrected_year <= 2025)
+
+# year is being replaced with the correct year
+robburg <- robburg %>%
+  mutate(year = corrected_year) %>%
+  select(-year_parsed, -alt_year, -corrected_year)
+
+
+```
+
+### Now I include and structure the data describing DST dates (and time... which is always 2am)
+
+```{r}
+# import dates from self-made csv file. Data from some website.
+dst_dates <- read_delim("dst_dates.csv", 
+                        delim = ";", escape_double = FALSE, trim_ws = TRUE)
+# remove empty row
+dst_dates <- dst_dates[-20,]
+
+dst_spring <- dst_dates$dst_start_date
+
+# Create a vector with all dates a week before and after the DST change in spring
+dst_period <- map(dst_spring, ~ seq(.x, .x + 6, by = "day")) |> unlist() |> as.Date(origin = "1970-01-01")
+
+# Some column-creating
+robburg$month <- month(as.Date(robburg$startdt))
+robburg$day <- day(as.Date(robburg$startdt))
+robburg$date <- as.Date(sprintf("%04d-%02d-%02d",
+                                as.integer(robburg$year),
+                                as.integer(robburg$month),
+                                as.integer(robburg$day)))
+robburg$hour <- hour(robburg$CMPLNT_FR_TM)
+robburg$weekday <- wday(robburg$date)
+
+# Assign treatment
+robburg <- robburg %>%
+  mutate(
+    DST = case_when(
+      date %in% dst_spring & hour < 2 ~ 0,
+      date %in% dst_period ~ 1,
+      TRUE ~ 0
+    )
+  )
+```
+
+### Darkness dummy
+
+```{r}
+p_load(suncalc)
+
+# Get unique dates. Latitude and Longitude are static for the centre of NYC
+nyc_dates <- robburg %>%
+  filter(!is.na(date)) %>%
+  distinct(date) %>%
+  mutate(
+    lat = 40.7128,
+    lon = -74.0060
+  )
+
+# Get sunrise/sunset times for NYC center
+nyc_suntimes <- getSunlightTimes(
+  data = nyc_dates,
+  keep = c("sunrise", "sunset"),
+  tz = "America/New_York"
+)
+
+robburg <- robburg %>%
+  left_join(nyc_suntimes, by = "date")
+
+# Construct datetime
+robburg <- robburg %>%
+  mutate(
+    hour_time = as.POSIXct(paste(format(date), sprintf("%02d:00:00", hour)),
+                           format = "%Y-%m-%d %H:%M:%S",
+                           tz = "America/New_York")
+  )
+
+
+# Create darkness dummy
+robburg <- robburg %>%
+  mutate(
+    darkness = if_else(hour_time < sunrise | hour_time >= sunset, 1, 0)
+  )
+```
+
+### Create crime_hourly
+
+The dependent variable is crime per hour, so I need to aggregate the data from above.
+
+```{r}
+crime_hourly <- robburg %>% group_by(date, hour, year, month, weekday, DST, darkness) %>% summarise(crime_count = n(), .groups = "drop")
+head(crime_hourly)
+```
+
+```{r}
+crime_hourly <- robburg %>%
+  group_by(date, hour, year, month, weekday, DST, darkness) %>%
+  summarise(
+    crime_count = n(),
+    robbery = sum(THEFT_OR_ROBBERY == "ROBBERY", na.rm = TRUE),
+    theft = sum(THEFT_OR_ROBBERY == "THEFT", na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Add running variable
+
+The running variable is the distance from the DST change in spring (in hours).
+
+```{r}
+dst_spring.df <- tibble(year = year(as.Date(dst_spring)))
+
+dst_spring.df$dst_date <- as.Date(dst_spring)
+
+crime_hourly <- crime_hourly %>%
+  left_join(dst_spring.df, by = "year")
+
+
+crime_hourly <- crime_hourly %>%
+  mutate(
+    # Construct the datetime correctly using `hour` column
+    datetime = as.POSIXct(paste(date, sprintf("%02d", .data$hour)), format = "%Y-%m-%d %H", tz = "UTC"),
+    
+    # Assume DST change happens at 2 AM (can be adjusted if needed)
+    dst_change_datetime = as.POSIXct(paste(dst_date, "02"), format = "%Y-%m-%d %H", tz = "UTC"),
+    
+    # Calculate running variable (in hours from DST change)
+    running = as.numeric(difftime(datetime, dst_change_datetime, units = "hours"))
+  )
+```
+
+Removing rows that do not have a value for darkness. 14 rows are dropped.
+
+```{r}
+crime_hourly <- crime_hourly %>% filter(is.na(darkness) == FALSE)
+```
+
+```{r}
+crime_hourly.c <- crime_hourly %>% filter(is.na(darkness) == FALSE) # drops 14 rows 
+```
+
+Create dummy variables for the covariates, because rdrobust cannot handle covariates as factors directly, so I need to create a matrix with 0/1 coded values.
+
+```{r}
+# Create dummy variables for categorical covariates
+x_dummies <- model.matrix(~ factor(year) + factor(month) + factor(hour) + factor(weekday) + factor(darkness) - 1, data = crime_hourly.c)
+```
+
+### Modeling RDDs
+
+```{r}
+p_load(rdrobust)
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=72)))
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=72, covs=x_dummies)))
+```
+
+```{r}
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=96)))
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=96, covs=x_dummies)))
+```
+
+```{r}
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=120)))
+summary(with(crime_hourly.c, rdrobust(crime_count, running, c=0, p=2, h=120, covs=x_dummies)))
+```
+
+### Plotting RDDs
+
+```{r}
+with(crime_hourly.c,
+     rdplot(
+        crime_count,
+        running,
+        c=0,
+        p=2,
+        h=120,
+        x.lim = c(-168, 168),
+       title = "Effect of DST Change on Hourly Crime Rates",
+       x.label = "Distance from Spring DST Change in Hours",
+       y.label = "Number of Crimes per Hour"
+))
+```
+
+```{r}
+with(crime_hourly.c,
+     rdplot(
+       crime_count,
+       running,
+       c=0,
+       p=2,
+       h=96,
+       x.lim = c(-120, 120),
+       title = "Effect of DST Change on Hourly Crime Rates",
+       x.label = "Distance from Spring DST Change in Hours",
+       y.label = "Number of Crimes per Hour"
+     ))
+```
+
+```{r}
+with(crime_hourly.c,
+     rdplot(
+       crime_count,
+       running,
+       c=0,
+       p=2,
+       h=72,
+       x.lim = c(-96, 96),
+       nbins = c(100000, 100000),
+       title = "Effect of DST Change on Hourly Crime Rates",
+       x.label = "Distance from Spring DST Change in Hours",
+       y.label = "Number of Crimes per Hour"
+     ))
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Filter data to +/- 96 hours
+crime_hourly.filtered <- crime_hourly.c %>%
+  filter(running >= -96, running <= 96)
+
+# Split data
+left <- crime_hourly.filtered %>% filter(running < 0)
+right <- crime_hourly.filtered %>% filter(running >= 0)
+
+# Modeling
+model_left <- lm(crime_count ~ running, data = left)
+model_right <- lm(crime_count ~ running, data = right)
+
+# Add predicted values for plotting lines
+left <- left %>% mutate(predicted = predict(model_left))
+right <- right %>% mutate(predicted = predict(model_right))
+
+# Plot
+ggplot(crime_hourly.filtered, aes(x = running, y = crime_count)) +
+  geom_point(alpha = 0.2, color = "pink") +
+  geom_line(data = left, aes(x = running, y = predicted), color = "darkblue", size = 1) +
+  geom_line(data = right, aes(x = running, y = predicted), color = "darkblue", size = 1) +
+  geom_vline(xintercept = 0, linetype = "solid") +
+  labs(
+    title = "Effect of DST Change on Hourly Crime Rates",
+    x = "Distance from Spring DST Change in Hours",
+    y = "Number of Crimes per Hour"
+  ) +
+  theme_light()
+
+
+```
+
+### 
